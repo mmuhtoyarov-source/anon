@@ -1,0 +1,11 @@
+from enum import Enum
+
+
+class UserState(str, Enum):
+    IDLE = "IDLE"
+    SEARCHING = "SEARCHING"
+    CREATE_TOPIC = "CREATE_TOPIC"
+    CONFIRM_TOPIC = "CONFIRM_TOPIC"
+    BROWSING_TOPICS = "BROWSING_TOPICS"
+    IN_DIALOG = "IN_DIALOG"
+    BANNED = "BANNED"

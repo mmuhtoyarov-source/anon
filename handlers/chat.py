@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from aiogram import Router
+from aiogram.filters import CommandStart
+from aiogram.types import Message
+
+from keyboards import (
+    BANNED_KB,
+    BROWSE_TOPICS_KB,
+    BTN_BACK,
+    BTN_BROWSE_TOPICS,
+    BTN_CANCEL,
+    BTN_CANCEL_SEARCH,
+    BTN_CONFIRM,
+    BTN_CREATE_TOPIC,
+    BTN_END_DIALOG,
+    BTN_FIND,
+    BTN_NEXT_TOPIC,
+    BTN_REPORT,
+    BTN_START_DIALOG,
+    CONFIRM_TOPIC_KB,
+    CREATE_TOPIC_KB,
+    DIALOG_KB,
+    MAIN_MENU_KB,
+    SEARCHING_KB,
+)
+from services.dialogs import DialogService
+from services.matchmaking import MatchmakingService
+from services.safe_sender import safe_copy_to, safe_reply, safe_send_message
+from services.topics import TopicService
+from states import UserState
+from storage.postgres_store import PostgresStorage
+from storage.redis_store import RedisStorage
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+@router.message(CommandStart())
+async def on_start(message: Message, redis: RedisStorage, pg: PostgresStorage) -> None:
+    logger.info(f"on_start: user={message.from_user.id}, text={message.text!r}")
+    await pg.upsert_user(message.from_user.id)
+    if await redis.has_ttl_flag("ban", message.from_user.id):
+        await redis.set_state(message.from_user.id, UserState.BANNED)
+        await safe_reply(message, " Вы временно заблокированы", reply_markup=BANNED_KB)
+        return
+    await redis.set_state(message.from_user.id, UserState.IDLE)
+    await safe_reply(message, "Выберите действие", reply_markup=MAIN_MENU_KB)
+
+
+@router.message()
+async def on_message(
+    message: Message,
+    redis: RedisStorage,
+    matchmaking: MatchmakingService,
+    dialogs: DialogService,
+    topics: TopicService,
+) -> None:
+    user_id = message.from_user.id
+    if await redis.has_ttl_flag("ban", user_id):
+        await redis.set_state(user_id, UserState.BANNED)
+        await safe_reply(message, " Вы временно заблокированы", reply_markup=BANNED_KB)
+        return
+
+    state = await redis.get_state(user_id)
+    logger.info(f"on_message: user={user_id}, state={state}, text={message.text!r}")
+    text = message.text or ""
+    if state == UserState.IDLE:
+        await handle_idle(message, text, redis, matchmaking)
+    elif state == UserState.SEARCHING:
+        await handle_searching(message, text, matchmaking)
+    elif state == UserState.CREATE_TOPIC:
+        await handle_create_topic(message, text, redis)
+    elif state == UserState.CONFIRM_TOPIC:
+        await handle_confirm_topic(message, text, redis, topics)
+    elif state == UserState.BROWSING_TOPICS:
+        await handle_browsing(message, text, redis, matchmaking, dialogs)
+    elif state == UserState.IN_DIALOG:
+        await handle_dialog(message, text, redis, dialogs)
+    else:
+        await safe_reply(message, " Вы временно заблокированы", reply_markup=BANNED_KB)
+
+
+async def handle_idle(message: Message, text: str, redis: RedisStorage, matchmaking: MatchmakingService) -> None:
+    user_id = message.from_user.id
+    logger.info(f"handle_idle: user={user_id}, text={text!r}")
+    if text == BTN_FIND:
+        await matchmaking.begin_search(user_id)
+        await safe_reply(message, "Ищем собеседника...", reply_markup=SEARCHING_KB)
+        asyncio.create_task(search_with_timeout(message, matchmaking, redis, 20))
+        return
+    if text == BTN_CREATE_TOPIC:
+        await redis.set_state(user_id, UserState.CREATE_TOPIC)
+        await safe_reply(message, "Введите текст темы", reply_markup=CREATE_TOPIC_KB)
+        return
+    if text == BTN_BROWSE_TOPICS:
+        await enter_browse_topics(message, redis)
+        return
+    await safe_reply(message, "Выберите действие", reply_markup=MAIN_MENU_KB)
+
+
+
+
+async def search_with_timeout(
+    message: Message,
+    matchmaking: MatchmakingService,
+    redis: RedisStorage,
+    timeout_seconds: int,
+) -> None:
+    user_id = message.from_user.id
+    for _ in range(timeout_seconds):
+        state = await redis.get_state(user_id)
+        if state != UserState.SEARCHING:
+            return
+        matched, _dialog_id, partner = await matchmaking.try_match(user_id)
+        if matched:
+            await safe_send_message(message.bot, user_id, "Собеседник найден!", reply_markup=DIALOG_KB)
+            await safe_send_message(message.bot, partner, "Собеседник найден!", reply_markup=DIALOG_KB)
+            return
+        await asyncio.sleep(1)
+    await matchmaking.cancel_search(user_id)
+    await safe_send_message(message.bot, user_id, "Поиск завершен по таймауту", reply_markup=MAIN_MENU_KB)
+
+async def handle_searching(message: Message, text: str, matchmaking: MatchmakingService) -> None:
+    user_id = message.from_user.id
+    if text == BTN_CANCEL_SEARCH:
+        await matchmaking.cancel_search(user_id)
+        await safe_reply(message, "Поиск остановлен", reply_markup=MAIN_MENU_KB)
+        return
+    matched, _dialog_id, partner = await matchmaking.try_match(user_id)
+    if matched:
+        await safe_reply(message, "Собеседник найден!", reply_markup=DIALOG_KB)
+        await safe_send_message(message.bot, partner, "Собеседник найден!", reply_markup=DIALOG_KB)
+        return
+    await asyncio.sleep(1)
+    await safe_reply(message, "Поиск продолжается... Нажмите отмену для выхода.", reply_markup=SEARCHING_KB)
+
+
+async def handle_create_topic(message: Message, text: str, redis: RedisStorage) -> None:
+    user_id = message.from_user.id
+    if text == BTN_CANCEL:
+        await redis.set_state(user_id, UserState.IDLE)
+        await redis.set_topic_draft(user_id, None)
+        await safe_reply(message, "Отменено", reply_markup=MAIN_MENU_KB)
+        return
+    if not text:
+        await safe_reply(message, "Введите непустой текст темы", reply_markup=CREATE_TOPIC_KB)
+        return
+    await redis.set_topic_draft(user_id, text)
+    await redis.set_state(user_id, UserState.CONFIRM_TOPIC)
+    await safe_reply(message, f"Тема:\n{text}", reply_markup=CONFIRM_TOPIC_KB)
+
+
+async def handle_confirm_topic(message: Message, text: str, redis: RedisStorage, topics: TopicService) -> None:
+    user_id = message.from_user.id
+    if text == BTN_CANCEL:
+        await redis.set_state(user_id, UserState.IDLE)
+        await redis.set_topic_draft(user_id, None)
+        await safe_reply(message, "Отменено", reply_markup=MAIN_MENU_KB)
+        return
+    if text != BTN_CONFIRM:
+        await safe_reply(message, "Подтвердите или отмените", reply_markup=CONFIRM_TOPIC_KB)
+        return
+    draft = await redis.get_topic_draft(user_id)
+    if not draft:
+        await redis.set_state(user_id, UserState.IDLE)
+        await safe_reply(message, "Черновик темы не найден", reply_markup=MAIN_MENU_KB)
+        return
+    await topics.create_topic(user_id, draft)
+    await redis.set_topic_draft(user_id, None)
+    await redis.set_state(user_id, UserState.IDLE)
+    await safe_reply(message, "Тема создана", reply_markup=MAIN_MENU_KB)
+
+
+async def enter_browse_topics(message: Message, redis: RedisStorage) -> None:
+    user_id = message.from_user.id
+    topic_ids = await redis.list_topic_ids()
+    await redis.set_topic_cursor(user_id, topic_ids, 0)
+    await redis.set_state(user_id, UserState.BROWSING_TOPICS)
+    await send_current_topic(message, redis)
+
+
+async def send_current_topic(message: Message, redis: RedisStorage) -> None:
+    topic_ids, idx = await redis.get_topic_cursor(message.from_user.id)
+    if not topic_ids:
+        await redis.set_state(message.from_user.id, UserState.IDLE)
+        await safe_reply(message, "Тем пока нет", reply_markup=MAIN_MENU_KB)
+        return
+    topic_id = topic_ids[idx % len(topic_ids)]
+    topic = await redis.get_topic(topic_id)
+    if not topic:
+        await safe_reply(message, "Тема истекла", reply_markup=BROWSE_TOPICS_KB)
+        return
+    await safe_reply(message, f"Тема: {topic['text']}", reply_markup=BROWSE_TOPICS_KB)
+
+
+async def handle_browsing(
+    message: Message,
+    text: str,
+    redis: RedisStorage,
+    matchmaking: MatchmakingService,
+    dialogs: DialogService,
+) -> None:
+    user_id = message.from_user.id
+    if text == BTN_BACK:
+        await redis.set_state(user_id, UserState.IDLE)
+        await safe_reply(message, "Главное меню", reply_markup=MAIN_MENU_KB)
+        return
+    if text == BTN_NEXT_TOPIC:
+        topic_ids, idx = await redis.get_topic_cursor(user_id)
+        await redis.set_topic_cursor(user_id, topic_ids, idx + 1)
+        await send_current_topic(message, redis)
+        return
+    if text == BTN_REPORT:
+        target = await dialogs.report_partner(user_id, "topic_report")
+        if target is None:
+            await safe_reply(message, "Жалоба учтена", reply_markup=BROWSE_TOPICS_KB)
+            return
+        await safe_reply(message, "Пользователь заблокирован", reply_markup=BROWSE_TOPICS_KB)
+        return
+    if text == BTN_START_DIALOG:
+        matched, _dialog_id, partner = await matchmaking.try_match(user_id)
+        if matched:
+            await safe_reply(message, "Диалог начат", reply_markup=DIALOG_KB)
+            await safe_send_message(message.bot, partner, "Диалог начат", reply_markup=DIALOG_KB)
+            return
+        await safe_reply(message, "Не удалось начать диалог", reply_markup=BROWSE_TOPICS_KB)
+        return
+    await send_current_topic(message, redis)
+
+
+async def handle_dialog(message: Message, text: str, redis: RedisStorage, dialogs: DialogService) -> None:
+    user_id = message.from_user.id
+    if text == BTN_END_DIALOG:
+        partner = await dialogs.finish_dialog(user_id, "user_end")
+        await safe_reply(message, "Диалог завершён", reply_markup=MAIN_MENU_KB)
+        if partner:
+            await safe_send_message(message.bot, partner, "Собеседник завершил диалог", reply_markup=MAIN_MENU_KB)
+        return
+    if text == BTN_REPORT:
+        partner = await dialogs.report_partner(user_id)
+        await safe_reply(message, "Жалоба отправлена", reply_markup=MAIN_MENU_KB)
+        if partner:
+            await safe_send_message(message.bot, partner, "Вы временно заблокированы", reply_markup=BANNED_KB)
+        return
+
+    _dialog_id, partner = await dialogs.get_partner(user_id)
+    if partner is None:
+        await redis.set_state(user_id, UserState.IDLE)
+        await safe_reply(message, "Диалог истек", reply_markup=MAIN_MENU_KB)
+        return
+    await safe_copy_to(message, partner)
